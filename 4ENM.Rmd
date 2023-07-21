@@ -1,0 +1,393 @@
+Wallace Session 2023-06-07
+Erica Johnson
+Cloud Forest
+================
+
+Please find below the R code history from your *Wallace* v1.9.0 session.
+
+### Package installation
+
+Wallace uses the following R packages that must be installed and loaded
+before starting.
+
+```{r}
+library(spocc)
+library(spThin)
+library(dismo)
+library(rgeos)
+library(raster)
+library(ENMeval)
+library(wallace)
+```
+
+------------------------------------------------------------------------
+
+## Analysis for *Cloud forest* (Cf)
+
+User CSV path with occurrence data. 
+
+```{r}
+# NOTE: provide the folder path of the .csv file
+occs_path <- "/home/erica/PhD/ENMRandomization/ENMReal/data/MexVeg/OccData/RandFilt"
+occs_path <- file.path(occs_path, "Cloud_forest25.csv")
+# get a list of species occurrence data
+userOccs_Cf <- occs_userOccs(
+  txtPath = occs_path, 
+  txtName = "Cloud_forest25", 
+  txtSep = ",", 
+  txtDec = ".")
+occs_Cf <- userOccs_Cf$Cloud_forest$cleaned
+```
+
+### Obtain environmental data
+
+Using user-specified variables.
+
+```{r}
+## Specify the directory with the environmental variables
+dir_envs_Cf <- "/home/erica/PhD/ENMRandomization/ENMReal/data/MexVeg/Env"
+envs_path <- file.path(dir_envs_Cf, dir(dir_envs_Cf, pattern = ".grd"))
+
+# All preds: Chelsa bioclim + cloud cover + soil
+envs_Cf <- envs_userEnvs(
+  rasPath = envs_path,
+  rasName = dir(dir_envs_Cf, pattern = ".grd$"),
+  doBrick = FALSE)
+```
+
+```{r}
+occs_xy_Cf <- occs_Cf[c('longitude', 'latitude')]
+occs_vals_Cf <- as.data.frame(raster::extract(envs_Cf, occs_xy_Cf))
+# remove occurrence records with NA environmental values
+occs_Cf <- occs_Cf[!(rowSums(is.na(occs_vals_Cf)) > 1), ]
+# also remove variable value rows with NA environmental values
+occs_vals_Cf <- na.omit(occs_vals_Cf)
+# add columns for env variable values for each occurrence record
+occs_Cf <- cbind(occs_Cf, occs_vals_Cf)
+```
+
+### Process environmental data
+
+Sampling the entire available environmental background using a “point buffers” method with a 0.25 degree buffer.
+```{r}
+# Generate background extent 
+bgExt_Cf <- penvs_bgExtent(
+  occs = occs_Cf,
+  bgSel = "point buffers",
+  bgBuf = 0.25)
+# Mask environmental data to provided extent
+bgMask_Cf <- penvs_bgMask(
+  occs = occs_Cf,
+  envs = envs_Cf,
+  bgExt = bgExt_Cf)
+# Sample the full environmental background from the provided area
+bgSample_Cf <- penvs_bgSample(
+  occs = occs_Cf,
+  bgMask =  bgMask_Cf,
+  bgPtsNum = sum(!is.na(getValues(bgMask_Cf[[1]])))) #ADDED BY EEJ 
+
+# Extract values of environmental layers for each background point
+bgEnvsVals_Cf <- as.data.frame(raster::extract(bgMask_Cf,  bgSample_Cf))
+
+
+##Add extracted values to background points table
+bgEnvsVals_Cf <- cbind(scientific_name = paste0("bg_", "Cloud forest"), bgSample_Cf,
+                       occID = NA, year = NA, institution_code = NA, country = NA,
+                            state_province = NA, locality = NA, elevation = NA,
+                            record_type = NA, bgEnvsVals_Cf)
+
+
+#Remove rows with NAs to ensure all predictor sets have equal number of bg
+bgEnvsVals_Cf<- bgEnvsVals_Cf %>% tidyr::drop_na(any_of(names(envs_Cf)))
+
+#Remove those coords in bgSample
+bgSample_Cf <- dplyr::inner_join(bgSample_Cf, 
+                    bgEnvsVals_Cf, by = c('longitude', 'latitude'))
+```
+
+```{r}
+#Exporting environmental background rasters
+bg.dir <- "/home/erica/PhD/ENMRandomization/ENMReal/data/MexVeg/Bg"
+writeRaster(bgMask_Cf, paste(bg.dir, "CF_Bg.grd", sep = "/"), format = "raster", overwrite= T)
+```
+
+### Partition occurrence data
+
+Partition occurrences and background points for model training and
+validation using “spatial block”, a spatial partition method with an
+aggregation factor of 2.
+
+```{r}
+# R code to get partitioned data
+groups_Cf <- part_partitionOccs(
+  occs = occs_Cf ,
+  bg =  bgSample_Cf, 
+  method = "cb2",
+  bgMask = bgMask_Cf,
+  aggFact = 2) 
+```
+
+
+### Build and Evaluate Niche Model
+
+Generating a species distribution model using the maxnet algorithm
+as implemented in ENMeval V2.0 (with clamping = TRUE). For tuning using
+L, LQ, H, LQH, P, T feature classes and regularization multipliers in the 1, 5
+range increasing by 0.5. Using a total of 1 categorical predictor
+variables.
+
+```{r}
+# Run maxent model for the selected species for each predictor set
+
+#Bioclim only
+model_Cf_bioclim<- model_maxent(
+  occs = occs_Cf,
+  bg = bgEnvsVals_Cf[1:30],
+  user.grp = groups_Cf, 
+  bgMsk = bgMask_Cf[[1:19]],
+  rms = c(1,5), 
+  rmsStep = 0.5,
+  fcs = c('L','LQ','H','LQH','LQHP'),
+  clampSel = TRUE,
+  algMaxent = "maxent.jar",
+  parallel = TRUE,
+  numCores = 10)
+
+#Bioclim + cloud
+model_Cf_biocloud <- model_maxent(
+  occs = occs_Cf,
+  bg = bgEnvsVals_Cf[1:34],
+  user.grp = groups_Cf, 
+  bgMsk = bgMask_Cf[[1:23]],
+  rms = c(1,5), 
+  rmsStep = 0.5,
+  fcs = c('L','LQ','H','LQH','LQHP'),
+  clampSel = TRUE,
+  algMaxent = "maxent.jar",
+  parallel = TRUE,
+  numCores = 10)
+
+#Cloud only
+cloudEnvs = c(1:11, 31:34)
+model_Cf_cloud <- model_maxent(
+  occs = occs_Cf,
+  bg = bgEnvsVals_Cf[cloudEnvs],
+  user.grp = groups_Cf, 
+  bgMsk = bgMask_Cf[[20:23]],
+  rms = c(1,5), 
+  rmsStep = 0.5,
+  fcs = c('L','LQ','H','LQH','LQHP'),
+  clampSel = TRUE,
+  algMaxent = "maxent.jar",
+  parallel = TRUE,
+  numCores = 10)
+```
+
+```{r}
+#exporting ENMeval results
+dir_eval <- "/home/erica/PhD/ENMRandomization/ENMReal/outputs/MexVeg/ENMeval"
+dir_mod <- "/home/erica/PhD/ENMRandomization/ENMReal/outputs/MexVeg/Models"
+
+#Bioclim only
+write.csv(model_Cf_bioclim@results, paste(dir_eval, "CF_Bioclim.csv", sep = "/"), 
+          row.names = FALSE)
+write.csv(model_Cf_bioclim@results.partitions, paste(dir_eval, "partitions",
+                                             "CF_Bioclim_part.csv", sep = "/"), row.names = FALSE)
+saveRDS(model_Cf_bioclim, paste(dir_mod, "CF_Bioclim.rds", sep = "/"))
+
+#Bioclim + cloud
+write.csv(model_Cf_biocloud@results, paste(dir_eval, "CF_BioCloud.csv", sep = "/"), 
+          row.names = FALSE)
+write.csv(model_Cf_biocloud@results.partitions, paste(dir_eval, "partitions",
+                                             "CF_BioCloud_part.csv", sep = "/"), row.names = FALSE)
+saveRDS(model_Cf_biocloud, paste(dir_mod, "CF_BioCloud.rds", sep = "/"))
+
+
+#Cloud only
+write.csv(model_Cf_cloud@results, paste(dir_eval, "CF_Cloud.csv", sep = "/"), 
+          row.names = FALSE)
+write.csv(model_Cf_cloud@results.partitions, paste(dir_eval, "partitions",
+                                             "CF_Cloud_part.csv", sep = "/"), row.names = FALSE)
+saveRDS(model_Cf_cloud, paste(dir_mod, "CF_Cloud.rds", sep = "/"))
+```
+
+### Select optimal model 
+
+```{r}
+#' Selecting optimal models by lowest AICc
+#' @param sp character string of species name
+#' @param eval.dir Directory where ENMevaluation result tables are be saved
+#' @param mod.dir Directory where ENMevaluation objects are saved 
+#' @param preds character indicating the file name to match the predictor variables with
+
+model_select <- function(sp, eval.dir, mod.dir, preds){
+  library(dplyr)
+  #load ENMeval table and sorting by AICc
+  tbl <- read.csv(file.path(eval.dir, dir(eval.dir, pattern = paste(sp, preds, sep = "_"))))
+  tbl <- as_tibble(tbl)%>%
+      #Removing NAs
+      dplyr::filter(!is.na(AICc)) %>%
+      #Selecting co-optimal models by lowest AICc
+      dplyr::filter(AICc == min(AICc))%>%
+      dplyr::mutate(scientific_name = rep(sp, nrow(.))) %>% 
+      dplyr::mutate(predictors = rep(preds, nrow(.)))
+    
+    args <- list(fc = tbl$fc, rm = tbl$rm)
+  #exporting tuning arguments of co-optimal models
+  saveRDS(args, paste(mod.dir,paste(sp, preds, "args.rds", sep = "_"), sep = "/"))
+  return(tbl)
+}
+  
+```
+
+
+```{r}
+preds <- c("Bioclim", "BioCloud", "Cloud")
+mCf_select <- lapply(preds, function(p){
+  mod <- model_select(sp = "CF", eval.dir = dir_eval, mod.dir = dir_mod, preds = p)
+}) 
+
+
+mCf_select <- dplyr::bind_rows(mCf_select) %>% 
+  dplyr::relocate(scientific_name, predictors)
+
+if(file.exists(paste(dir_mod, "ENM_OptArgs.csv", sep = "/")) == F){
+    write.csv(mCf_select, paste(dir_mod, "ENM_OptArgs.csv", sep = "/"), 
+              row.names =  F)
+  } else {
+    write.table(mCf_select, paste(dir_mod, "ENM_OptArgs.csv", sep = "/"),
+                append = T, row.names = F, col.names = F, sep = ",")
+    
+  }
+```
+
+### Visualize
+
+Generate a raster of the Maxent generated model with no threshold (cloglog).
+
+```{r}
+# Select current model and obtain raster prediction
+
+predSel_Cf <- lapply(preds, function(p){
+  args <- mCf_select %>% dplyr:: filter(predictors == p)%>% 
+    dplyr::select(tune.args)
+  args <- args$tune.args
+  
+  if(p == "Bioclim"){
+    m_Cf <- model_Cf_bioclim@models[[args]]
+    bgMask <- bgMask_Cf[[1:19]]
+  } else if (p == "BioCloud"){
+    m_Cf <- model_Cf_biocloud@models[[args]]
+    bgMask <- bgMask_Cf[[1:23]]
+  } else if (p == "Cloud"){
+    m_Cf <- model_Cf_cloud@models[[args]]
+    bgMask <- bgMask_Cf[[20:23]]
+  } 
+  predSel_Cf <- dismo::predict(m_Cf, bgMask, type = "cloglog", clamp = TRUE)
+  
+  #export prediction raster
+  writeRaster(predSel_Cf,
+              paste("/home/erica/PhD/ENMRandomization/ENMReal/outputs/MexVeg/Rasters",
+              paste0("CF_",p,".tif"), sep = "/"),
+              format = "GTiff", overwrite = T)
+})
+```
+
+Obtaining and exporting lambdas files
+```{r}
+curves.dir <- "/home/erica/PhD/ENMRandomization/ENMReal/outputs/MexVeg/ResponseCurves/"
+
+lapply(preds[2:3], function(p){
+  args <- mCf_select %>% dplyr:: filter(predictors == p)%>% 
+    dplyr::select(tune.args)
+  args <- args$tune.args
+  if(p == "Bioclim"){
+    m_Cf <- model_Cf_bioclim@models[[args]]
+  } else if (p == "BioCloud"){
+    m_Cf <- model_Cf_biocloud@models[[args]]
+  } else if (p == "Cloud"){
+    m_Cf <- model_Cf_cloud@models[[args]]
+  } else if (p == "AllPreds"){
+    m_Cf <- model_Cf_soil@models[[args]]
+  }
+  lambdas <- lambdasDF(m_Cf, alg = "maxent.jar")
+  write.csv(lambdas, paste(curves.dir, paste0("CF_", p, "_lambdas.csv"), sep = "/"))
+  
+#pdf(file = "/home/erica/PhD/ENMRandomization/ENMReal/outputs/MexVeg/ResponseCurves/CF_Cloud_respcurve.pdf")
+#lapply(names(bgMask_Cf), maxnet::response.plot, x = m_Cf, var = bgMask, type = "cloglog")
+#while(!is.null(dev.list())) dev.off()
+})
+```
+
+
+## Calculating model thresholds
+
+Calculating the minimum training presence and 10 pct threshold. 
+
+```{r}
+#ADDED TO WALLACE RMD BY EEJ
+
+thresh <- lapply(predSel_Cf, function(p){
+pred_vals_Cf <- raster::extract(p, occs_xy_Cf)
+
+MTP <- min(na.omit(pred_vals_Cf))
+pct10 <-  rev(sort(pred_vals_Cf))[(ceiling(length(pred_vals_Cf) * 0.9))] 
+predictors <- names(p)
+th <- data.frame(predictors, MTP, pct10)
+
+if(file.exists(paste(dir_mod, "ENM_threshold.csv", sep = "/")) == F){
+    write.csv(th, paste(dir_mod, "ENM_threshold.csv", sep = "/"), 
+              row.names =  F)
+  } else {
+    write.table(th, paste(dir_mod, "ENM_threshold.csv", sep = "/"),
+                append = T, row.names = F, col.names = F, sep = ",")
+}
+})
+
+```
+
+## Project model
+
+Projecting the model to the Carso Huasteco + Gran Sierra Plegada
+
+```{r}
+# Loading the Carso Huasteco shapefile and defining it as the projection area
+proj_path <- "/home/erica/PhD/ENMRandomization/ENMReal/data/MexVeg/CountryData"
+proj_userExt_Cf <- rgdal::readOGR(file.path(proj_path, "SMOr.shp"), 
+                                  layer = "SMOr")
+
+# Generate a projection of the model to the desired area
+proj_area_Cf <- lapply(preds[2:3], function(p){
+  
+  args <- mCf_select %>% dplyr:: filter(predictors == p)%>% 
+    dplyr::select(tune.args)
+  args <- args$tune.args
+  
+  if(p == "Bioclim"){
+    m_Cf <- model_Cf_bioclim
+    # Create object of projection variables
+    projAreaEnvs_Cf <- envs_Cf[[1:19]]
+  } else if (p == "BioCloud"){
+    m_Cf <- model_Cf_biocloud
+    projAreaEnvs_Cf <- envs_Cf[[1:23]]
+  } else if (p == "Cloud"){
+    m_Cf <- model_Cf_cloud
+    projAreaEnvs_Cf <- envs_Cf[[20:23]]
+  }
+  
+  proj_area_Cf <- proj_area(
+    evalOut = m_Cf,
+    curModel = args,
+    envs = projAreaEnvs_Cf , 
+    outputType = "cloglog",
+    alg = "maxent.jar",
+    clamp = TRUE,
+    pjExt = proj_userExt_Cf) 
+  
+  out_path <- "/home/erica/PhD/ENMRandomization/ENMReal/outputs/MexVeg/Rasters"
+  
+  writeRaster(proj_area_Cf$projArea, 
+            paste(out_path, paste0("CF_", p,"_pj.tif"), sep = "/"), format = "GTiff", 
+            overwrite= T)
+})
+```
